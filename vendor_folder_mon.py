@@ -1,16 +1,17 @@
 import os
 import time
-import json
+import csv
 import statistics
 from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
 
 # Constants
-FEED_FOLDER = "/path/to/feed_folder"  # Path where feed folders are located
-METRICS_DIR = "/path/to/metrics"  # Directory to store daily metrics in JSON
-RETENTION_DAYS = 15  # Retain metrics for 15 days
-ROLLING_DAYS = 7  # Number of days to calculate rolling medians, time windows, etc.
+FEED_FOLDER = "/path/to/feed_folder"
+METRICS_FILE = "/path/to/metrics.csv"
+RETENTION_DAYS = 15
+ROLLING_DAYS = 7
+MIN_DAYS_FOR_ALERTING = 15  # Minimum days required for historical data before alerts are generated
 
 # Function to send alert email
 def send_alert(message):
@@ -22,15 +23,10 @@ def send_alert(message):
     with smtplib.SMTP('localhost') as s:
         s.send_message(msg)
 
-# Function to check if a file was modified today
-def is_file_modified_today(file_mod_time):
-    file_mod_date = datetime.fromtimestamp(file_mod_time).date()
-    today = datetime.now().date()
-    return file_mod_date == today
-
-# Function to capture feed metrics for files **only from today**
+# Function to capture feed metrics for files modified recently
 def get_feed_metrics(feed_folder):
     metrics = []
+    timestamp = time.time()
 
     for folder_name in os.listdir(feed_folder):
         folder_path = os.path.join(feed_folder, folder_name)
@@ -46,13 +42,10 @@ def get_feed_metrics(feed_folder):
                     file_size = os.path.getsize(file_path)
                     file_mod_time = os.path.getmtime(file_path)
 
-                    # Only consider files modified today
-                    if is_file_modified_today(file_mod_time):
-                        # Update metrics
-                        file_count += 1
-                        total_size += file_size
-                        file_sizes.append(file_size)
-                        file_arrival_times.append(file_mod_time)
+                    file_count += 1
+                    total_size += file_size
+                    file_sizes.append(file_size)
+                    file_arrival_times.append(file_mod_time)
 
             metrics.append({
                 "folder_name": folder_name,
@@ -60,138 +53,120 @@ def get_feed_metrics(feed_folder):
                 "total_size": total_size,
                 "file_sizes": file_sizes,
                 "file_arrival_times": file_arrival_times,
-                "timestamp": time.time()
+                "timestamp": timestamp
             })
     
     return metrics
 
-# Function to save the daily metrics to a file
-def save_metrics_to_file(metrics, metrics_dir, date=None):
-    # Use provided date or today's date
-    if date is None:
-        date = datetime.now().strftime("%Y-%m-%d")
-    metrics_file = os.path.join(metrics_dir, f"metrics_{date}.json")
-    
-    # Write the metrics to a JSON file
-    with open(metrics_file, "w") as f:
-        json.dump(metrics, f)
+# Function to append metrics to CSV file
+def append_metrics_to_csv(metrics, metrics_file):
+    file_exists = os.path.isfile(metrics_file)
 
-# Function to load the metrics for a specific day
-def load_metrics_from_file(metrics_dir, date):
-    metrics_file = os.path.join(metrics_dir, f"metrics_{date}.json")
-    
-    if os.path.exists(metrics_file):
-        with open(metrics_file, "r") as f:
-            return json.load(f)
-    return []
+    with open(metrics_file, "a", newline="") as csvfile:
+        fieldnames = ["timestamp", "folder_name", "file_count", "total_size", "file_sizes", "file_arrival_times"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
-# Function to load metrics from the past X days
-def load_past_metrics(metrics_dir, days):
+        if not file_exists:
+            writer.writeheader()
+        
+        for metric in metrics:
+            writer.writerow({
+                "timestamp": metric["timestamp"],
+                "folder_name": metric["folder_name"],
+                "file_count": metric["file_count"],
+                "total_size": metric["total_size"],
+                "file_sizes": metric["file_sizes"],
+                "file_arrival_times": metric["file_arrival_times"]
+            })
+
+# Function to load past metrics from CSV for historical analysis
+def load_past_metrics(metrics_file, days):
     past_metrics = []
-    for i in range(days):
-        date = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
-        daily_metrics = load_metrics_from_file(metrics_dir, date)
-        past_metrics.extend(daily_metrics)
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    if os.path.exists(metrics_file):
+        with open(metrics_file, "r") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                row_time = datetime.fromtimestamp(float(row["timestamp"]))
+                if row_time >= cutoff_date:
+                    past_metrics.append({
+                        "folder_name": row["folder_name"],
+                        "file_count": int(row["file_count"]),
+                        "total_size": int(row["total_size"]),
+                        "file_sizes": eval(row["file_sizes"]),
+                        "file_arrival_times": eval(row["file_arrival_times"]),
+                        "timestamp": float(row["timestamp"])
+                    })
     return past_metrics
 
-# Function to calculate median metrics over the past X days
-def calculate_median_metrics(metrics):
+# Function to calculate daily metrics once sufficient historical data is available
+def calculate_daily_metrics(today_metrics):
     folder_metrics = {}
     
-    for feed in metrics:
+    for feed in today_metrics:
         folder_name = feed['folder_name']
         
         if folder_name not in folder_metrics:
             folder_metrics[folder_name] = {
-                'file_counts': [],
                 'file_sizes': [],
                 'file_arrival_times': []
             }
         
-        folder_metrics[folder_name]['file_counts'].append(feed['file_count'])
         folder_metrics[folder_name]['file_sizes'].extend(feed['file_sizes'])
         folder_metrics[folder_name]['file_arrival_times'].extend(feed['file_arrival_times'])
     
-    # Calculate medians and percentiles for dynamic metrics
-    median_metrics = {}
+    daily_metrics = {}
     for folder_name, data in folder_metrics.items():
-        median_metrics[folder_name] = {
-            'median_file_count': statistics.median(data['file_counts']) if data['file_counts'] else 0,
-            'median_file_size': statistics.median(data['file_sizes']) if data['file_sizes'] else 0,
-            '10th_percentile_size': statistics.quantiles(data['file_sizes'], n=10)[0] if data['file_sizes'] else 0,
-            '90th_percentile_size': statistics.quantiles(data['file_sizes'], n=10)[8] if data['file_sizes'] else 0,
-            'median_arrival_time': statistics.median(data['file_arrival_times']) if data['file_arrival_times'] else 0,
-            'max_file_size': max(data['file_sizes']) if data['file_sizes'] else 0
+        all_arrival_times = data['file_arrival_times']
+        all_sizes = data['file_sizes']
+        
+        earliest_time = min(all_arrival_times) if all_arrival_times else None
+        latest_time = max(all_arrival_times) if all_arrival_times else None
+        size_10th_percentile = statistics.quantiles(all_sizes, n=10)[0] if all_sizes else 0
+        size_90th_percentile = statistics.quantiles(all_sizes, n=10)[8] if all_sizes else 0
+
+        daily_metrics[folder_name] = {
+            'earliest_time': earliest_time,
+            'latest_time': latest_time,
+            'size_10th_percentile': size_10th_percentile,
+            'size_90th_percentile': size_90th_percentile
         }
     
-    return median_metrics
+    return daily_metrics
 
-# Function to calculate dynamic time window based on past data
-def calculate_dynamic_time_window(metrics):
-    all_arrival_times = []
-    for feed in metrics:
-        all_arrival_times.extend(feed['file_arrival_times'])
-    
-    if not all_arrival_times:
-        return None, None
-
-    earliest_time = min(all_arrival_times)
-    latest_time = max(all_arrival_times)
-
-    return earliest_time, latest_time
-
-# Function to monitor feeds, considering dynamic time window, size ranges, and folder growth
+# Monitoring function, with alerting enabled only after 15 days of metrics have been captured
 def monitor_feeds():
-    # Get today's metrics
     today_metrics = get_feed_metrics(FEED_FOLDER)
-    today_date = datetime.now().strftime("%Y-%m-%d")
-    save_metrics_to_file(today_metrics, METRICS_DIR, today_date)
+    append_metrics_to_csv(today_metrics, METRICS_FILE)
 
-    # Load metrics for the past X days (rolling window)
-    past_metrics = load_past_metrics(METRICS_DIR, ROLLING_DAYS)
-    median_metrics = calculate_median_metrics(past_metrics)
+    # Load metrics for alerting after sufficient historical data is gathered
+    past_metrics = load_past_metrics(METRICS_FILE, RETENTION_DAYS)
 
-    # Compare today's metrics against historical data
-    for feed in today_metrics:
-        folder_name = feed['folder_name']
-        file_count = feed['file_count']
-        file_sizes = feed['file_sizes']
-        file_arrival_times = feed['file_arrival_times']
-        total_size = feed['total_size']
+    # Check if sufficient data exists before enabling alerting
+    if len(past_metrics) < MIN_DAYS_FOR_ALERTING:
+        print("Not enough historical data for alerting. Gathering data...")
+        return  # Exit before alerting
+    
+    # Calculate daily aggregates and metrics
+    all_today_metrics = load_past_metrics(METRICS_FILE, 1)
+    daily_metrics = calculate_daily_metrics(all_today_metrics)
 
-        # Get historical metrics for this folder
-        folder_median = median_metrics.get(folder_name, {})
-        median_file_count = folder_median.get('median_file_count', 0)
-        median_file_size = folder_median.get('median_file_size', 0)
-        max_file_size = folder_median.get('max_file_size', 50 * 1024 * 1024 * 1024)  # 50 GB default
-        file_size_10th_percentile = folder_median.get('10th_percentile_size', 0)
-        file_size_90th_percentile = folder_median.get('90th_percentile_size', max_file_size)
-
-        # Dynamic time window for file arrival
-        earliest_time, latest_time = calculate_dynamic_time_window(past_metrics)
-
-        # Check for 0-byte files and trigger alert
-        if any(size == 0 for size in file_sizes):
-            send_alert(f"Feed {folder_name} has 0-byte files.")
-
-        # Check if today's file count is significantly lower than the median
-        if file_count < median_file_count:
-            send_alert(f"Feed {folder_name} has fewer files ({file_count}) than the median ({median_file_count}).")
-
-        # Check if today's file sizes deviate from the size range (10th-90th percentile)
-        if any(size < file_size_10th_percentile or size > file_size_90th_percentile for size in file_sizes):
-            send_alert(f"Feed {folder_name} has files outside the expected size range ({file_size_10th_percentile / (1024 * 1024)} MB - {file_size_90th_percentile / (1024 * 1024)} MB).")
-
-        # Check if today's files arrived outside the dynamic time window
-        current_time = time.time()
-        if earliest_time and latest_time and not (earliest_time <= current_time <= latest_time):
-            send_alert(f"Feed {folder_name} has files arriving outside the expected time window.")
-
-        # Check if folder size growth is as expected
-        past_folder_sizes = [feed['total_size'] for feed in past_metrics if feed['folder_name'] == folder_name]
-        if total_size < statistics.median(past_folder_sizes) and total_size != 0:
-            send_alert(f"Folder {folder_name} is not growing as expected. Current size: {total_size / (1024 * 1024)} MB.")
+    # Alerting logic based on calculated metrics
+    for folder_name, metrics in daily_metrics.items():
+        if metrics['earliest_time'] and metrics['latest_time']:
+            now = time.time()
+            if not (metrics['earliest_time'] <= now <= metrics['latest_time']):
+                send_alert(f"Feed {folder_name} files arrived outside the expected time window today.")
         
-# Main function to run feed monitoring
+        if any(size == 0 for size in [m['file_sizes'] for m in today_metrics if m['folder_name'] == folder_name]):
+            send_alert(f"Feed {folder_name} has 0-byte files.")
+        
+        for feed in today_metrics:
+            if feed["folder_name"] == folder_name:
+                if any(size < metrics['size_10th_percentile'] or size > metrics['size_90th_percentile'] for size in feed['file_sizes']):
+                    send_alert(f"Feed {folder_name} has files outside the expected size range.")
+
+# Main function
 if __name__ == "__main__":
-    monitor_feeds
+    monitor_feeds()
