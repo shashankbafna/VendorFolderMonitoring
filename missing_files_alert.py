@@ -1,125 +1,103 @@
 import os
-import glob
 import csv
-import time
+import statistics
 from datetime import datetime, timedelta
-from statistics import median
 from collections import defaultdict
 
-# Directory where daily metrics files are stored
-METRICS_DIR = "/path/to/metrics/files"
-# Directory to save the generated alert reports
-REPORT_DIR = "/path/to/reports"
-# Threshold for delay in minutes
-DELAY_THRESHOLD = 10
-# Timestamp format used in metrics files
-TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+# Path to the directory containing metrics files
+METRICS_DIR = os.getenv("path_to_metrics_files")
+# Path to the output report file
+REPORT_FILE = os.getenv("path_to_metrics_files")+"/missing_files_report.txt"
 
-
-def parse_metrics_file(file_path):
-    """Parse a metrics file and return data as a list of dictionaries."""
+# Helper function to parse metrics from a CSV file
+def parse_metrics(file_path):
     metrics = []
-    with open(file_path, "r") as file:
-        reader = csv.reader(file, delimiter="^")
+    with open(file_path, 'r') as f:
+        reader = csv.reader(f, delimiter='^')
+        next(reader)  # Skip the header
         for row in reader:
-            if len(row) < 9:
-                continue  # Skip malformed rows
-            metrics.append({
-                "capture_time": row[0],
-                "folder_name": row[1],
-                "file_descriptions": row[8]
-            })
+            file_description = row[8]
+            folder_name = row[1]
+            capture_time = datetime.strptime(row[0], "%Y%m%d_%H%M%S")
+            if file_description != "None":
+                for entry in file_description.split("|"):
+                    regex, params = entry.split("#")
+                    count, median_size, median_time, earliest, latest = eval(params)
+                    metrics.append({
+                        "folder": folder_name,
+                        "count": count,
+                        "regex": regex,
+                        "capture_time": capture_time,
+                        "median_time": datetime.strptime(median_time, "%H:%M").time(),
+                        "earliest": datetime.fromtimestamp(earliest),
+                        "latest": datetime.fromtimestamp(latest)
+                    })
     return metrics
 
-
-def calculate_median_window(historical_data):
-    """Calculate the median window for file arrivals."""
-    windows = [data["time_minutes"] for data in historical_data]
-    median_minutes = median(windows)
-    return median_minutes - DELAY_THRESHOLD, median_minutes + DELAY_THRESHOLD
-
-
-def check_missing_files(historical_data, current_data):
-    """Check for missing files in the current data based on historical data."""
-    missing_files = []
-
-    for folder_name, file_patterns in historical_data.items():
-        current_files = {entry["regex"] for entry in current_data.get(folder_name, [])}
-
-        for pattern, records in file_patterns.items():
-            time_window = calculate_median_window(records)
-            found_in_window = any(
-                time_window[0] <= data["time_minutes"] <= time_window[1] for data in records
-            )
-
-            if not found_in_window or pattern not in current_files:
-                missing_files.append((folder_name, pattern))
-
-    return missing_files
-
-
-def get_current_data():
-    """Fetch the current metrics for comparison."""
-    current_data = defaultdict(list)
-    latest_file = max(glob.glob(os.path.join(METRICS_DIR, "*.info")), key=os.path.getctime)
-    metrics = parse_metrics_file(latest_file)
-
-    for entry in metrics:
-        folder_name = entry["folder_name"]
-        for file_desc in entry["file_descriptions"].split("|"):
-            regex, file_info = file_desc.split("#")
-            time_minutes = int(datetime.fromtimestamp(int(file_info.split(",")[2])).strftime("%H%M"))
-            current_data[folder_name].append({"regex": regex, "time_minutes": time_minutes})
-
-    return current_data
-
-
-def get_historical_data():
-    """Fetch historical metrics for calculating median thresholds."""
-    historical_data = defaultdict(lambda: defaultdict(list))
-    cutoff_date = (datetime.now() - timedelta(days=5)).strftime("%Y%m%d")
-
-    for file_path in sorted(glob.glob(os.path.join(METRICS_DIR, "*.info"))):
-        file_date = os.path.basename(file_path).split(".")[2]
-        if file_date < cutoff_date:
-            continue
-
-        metrics = parse_metrics_file(file_path)
-        for entry in metrics:
-            folder_name = entry["folder_name"]
-            for file_desc in entry["file_descriptions"].split("|"):
-                regex, file_info = file_desc.split("#")
-                time_minutes = int(datetime.fromtimestamp(int(file_info.split(",")[2])).strftime("%H%M"))
-                historical_data[folder_name][regex].append({"time_minutes": time_minutes})
-
-    return historical_data
-
-
-def write_report(missing_files):
-    """Write the missing files report to a file."""
-    if not missing_files:
+# Helper function to calculate median time range with a threshold
+def calculate_median_window(times):
+    if not times:
         return None
+    times.sort()
+    n = len(times)
+    if n % 2 == 0:  # Even number of elements
+        median_time = (times[n // 2 - 1] + times[n // 2]) / 2
+    else:  # Odd number of elements
+        median_time = times[n // 2]
+    lower_bound = (median_time - timedelta(minutes=10)).time()
+    upper_bound = (median_time + timedelta(minutes=10)).time()
+    return lower_bound, upper_bound
 
-    report_file = os.path.join(REPORT_DIR, f"missing_files_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
-    with open(report_file, "w") as file:
-        for folder, pattern in missing_files:
-            file.write(f"Folder: {folder}, Missing Pattern: {pattern}\n")
+# Main function to check for missing files
+def check_missing_files():
+    all_metrics = []
 
-    return report_file
+    # Read all metrics files for the day
+    for file_name in os.listdir(METRICS_DIR):
+        if file_name.endswith(".info"):
+            all_metrics.extend(parse_metrics(os.path.join(METRICS_DIR, file_name)))
 
+    # Group metrics by folder and regex
+    grouped_metrics = defaultdict(list)
+    for metric in all_metrics:
+        key = (metric["folder"], metric["regex"])
+        grouped_metrics[key].append(metric)
 
-def main():
-    historical_data = get_historical_data()
-    current_data = get_current_data()
-    missing_files = check_missing_files(historical_data, current_data)
+    # Check for missing files
+    missing_files_report = []
+    for (folder, regex), records in grouped_metrics.items():
+        valid_records = [record for record in records if record["earliest"] and record["latest"]]
+        times = [record["earliest"].time() for record in valid_records]
+        if len(times) >= 5:
+            median_window = calculate_median_window(times[-5:])
+            if median_window:
+                lower_bound, upper_bound = median_window
 
-    report_file = write_report(missing_files)
-    if report_file:
-        print(f"Alert: Missing files detected. Report generated at {report_file}")
-        # You can integrate an email alert system here
-    else:
-        print("No missing files detected.")
+                # Check if today's file is within the window
+                today_records = [
+                    record for record in valid_records
+                    if record["capture_time"].date() == datetime.today().date()
+                ]
+                within_window = any(
+                    lower_bound <= record["earliest"].time() <= upper_bound
+                    for record in today_records
+                )
+                if not within_window:
+                    missing_files_report.append(
+                        f"Folder: {folder}, Pattern: {regex}, Expected Window: {lower_bound}-{upper_bound}"
+                    )
 
+    # Write the report to a file
+    with open(REPORT_FILE, 'w') as f:
+        if missing_files_report:
+            f.write("\n".join(missing_files_report))
+        else:
+            f.write("No missing files detected.")
+
+    return bool(missing_files_report)
 
 if __name__ == "__main__":
-    main()
+    if check_missing_files():
+        print("Alert: Missing files detected. Check the report.")
+    else:
+        print("No missing files detected.")
