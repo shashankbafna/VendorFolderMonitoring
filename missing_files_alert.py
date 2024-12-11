@@ -84,7 +84,7 @@ def check_missing_files():
 
     # Read all metrics files within the lookback period
     for file_name in os.listdir(METRICS_DIR):
-        if file_name.startswith("prod.tvem.") and file_name.endswith(".info"):
+        if file_name.endswith(".info"):
             file_date = datetime.strptime(file_name.split(".")[2], "%Y%m%d")
             if file_date >= cutoff_date:
                 all_metrics.extend(parse_metrics(os.path.join(METRICS_DIR, file_name)))
