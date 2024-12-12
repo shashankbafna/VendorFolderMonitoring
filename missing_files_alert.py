@@ -1,38 +1,65 @@
+#!/usr/bin/python3
 import os
 import csv
+import re
+import logging
 import statistics
+import argparse
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+# Argument parser for setting log level dynamically
+parser = argparse.ArgumentParser(description="File Monitoring Script")
+parser.add_argument(
+    "--loglevel", 
+    default="INFO", 
+    choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    help="Set the logging level (default: INFO)"
+)
+args = parser.parse_args()
+
+# Configure logging
+logging.basicConfig(
+    filename='file_check.log',
+    level=getattr(logging, args.loglevel),
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
 # Path to the directory containing metrics files
-METRICS_DIR = os.getenv("path_to_metrics_files")
+METRICS_DIR = "path_to_metrics_files"
 # Lookback period for historical metrics in days
 LOOKBACK_DAYS = 7
-# Threshold for late file arrivals
-THRESHOLD_MINUTES = 10
+# Threshold minutes delay expected
+THRESHOLD_MINS = 10
 # File to maintain state of file arrivals
-STATE_FILE = f"file_arrival_state_{datetime.now().strftime('%Y%m%d')}.csv"
+STATE_FILE = "file_arrival_state_" + datetime.now().strftime('%Y%m%d') + ".csv"
 
 # Helper function to parse metrics from a CSV file
-# Only parse metrics from midnight to the current time to optimize processing
-def parse_metrics(file_path):
+# Only parse metrics up to the current hour to optimize processing
+def parse_metrics(file_path, state):
     metrics = []
     current_time = datetime.now()
-    current_date_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-
+    current_hour = current_time.hour
     with open(file_path, 'r') as f:
         reader = csv.reader(f, delimiter='^')
         next(reader)  # Skip the header
         for row in reader:
-            capture_time = datetime.strptime(row[0], "%Y%m%d_%H%M%S")
-            if capture_time < current_date_start or capture_time > current_time:
-                continue  # Ignore metrics outside today's time range
-
             file_description = row[8]
             folder_name = row[1]
-            if file_description != "None":
-                for entry in file_description.split("|"):
+            capture_time = datetime.strptime(row[0], "%Y%m%d_%H%M%S")
+            logging.debug(f"Parsing row: {row}")
+            if capture_time.hour > current_hour or file_description == "None":
+                logging.debug("Skipping record: Capture time exceeds current hour or file description is None.")
+                continue  # Ignore metrics for times later than the current hour today
+            for entry in file_description.split("|"):
+                try:
                     regex, params = entry.split("#")
+                    if not validate_regex(regex):
+                        logging.warning(f"Invalid regex pattern detected: {regex}")
+                        continue
+                    if regex in state.get(folder_name, set()):
+                        logging.debug(f"Skipping already successful regex: {regex}")
+                        continue  # Skip already successful file patterns
                     count, median_size, median_time, earliest, latest = eval(params)
                     metrics.append({
                         "folder": folder_name,
@@ -42,20 +69,33 @@ def parse_metrics(file_path):
                         "earliest": datetime.fromtimestamp(earliest),
                         "latest": datetime.fromtimestamp(latest)
                     })
+                except Exception as e:
+                    logging.error(f"Error parsing entry: {entry} in file {file_path} - {e}")
     return metrics
+
+# Helper function to validate regex patterns
+def validate_regex(pattern):
+    try:
+        re.compile(pattern)
+        return True
+    except re.error:
+        return False
 
 # Helper function to calculate median time range with a threshold
 def calculate_median_window(times):
     if not times:
+        logging.debug("No times available to calculate median window.")
         return None
     times.sort()
     n = len(times)
     if n % 2 == 0:  # Even number of elements
-        median_time = (datetime.combine(datetime.today(), times[n // 2 - 1]) + datetime.combine(datetime.today(), times[n // 2])).time()
+        median_time = (datetime.combine(datetime.today(), times[n // 2 - 1]) +
+                       timedelta(minutes=(datetime.combine(datetime.today(), times[n // 2]) - datetime.combine(datetime.today(), times[n // 2 - 1])).seconds // 120)).time()
     else:  # Odd number of elements
         median_time = times[n // 2]
-    lower_bound = (datetime.combine(datetime.today(), median_time) - timedelta(minutes=THRESHOLD_MINUTES)).time()
-    upper_bound = (datetime.combine(datetime.today(), median_time) + timedelta(minutes=THRESHOLD_MINUTES)).time()
+    lower_bound = (datetime.combine(datetime.today(), median_time) - timedelta(minutes=THRESHOLD_MINS)).time()
+    upper_bound = (datetime.combine(datetime.today(), median_time) + timedelta(minutes=THRESHOLD_MINS)).time()
+    logging.debug(f"Calculated median window: {lower_bound} - {upper_bound}")
     return lower_bound, upper_bound
 
 # Load the state of file arrivals
@@ -67,6 +107,7 @@ def load_state():
             for row in reader:
                 folder, regex = row
                 state[folder].add(regex)
+    logging.debug(f"Loaded state: {dict(state)}")
     return state
 
 # Save the state of file arrivals
@@ -76,32 +117,53 @@ def save_state(state):
         for folder, regexes in state.items():
             for regex in regexes:
                 writer.writerow([folder, regex])
+    logging.debug("State saved successfully.")
+
+# Real-time folder check to confirm if a file matching the regex exists
+def real_time_folder_check(folder, regex):
+    folder_path = os.path.join(METRICS_DIR, folder)
+    logging.debug(f"Checking folder: {folder_path} for regex: {regex}")
+    if not os.path.exists(folder_path):
+        logging.info(f"Folder not found: {folder_path}")
+        return False
+    try:
+        pattern = re.compile(regex)
+        today = datetime.now().date()
+        for file_name in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, file_name)
+            if os.path.isfile(file_path) and datetime.fromtimestamp(os.path.getmtime(file_path)).date() == today:
+                if pattern.match(file_name):
+                    logging.info(f"File matching regex '{regex}' found in folder '{folder}'.")
+                    return True
+        logging.info(f"No files matching regex '{regex}' found in folder '{folder}' for today.")
+    except Exception as e:
+        logging.error(f"Error checking files in folder {folder} with regex {regex}: {e}")
+    return False
 
 # Main function to check for missing files
 def check_missing_files():
     all_metrics = []
     cutoff_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
-
     # Read all metrics files within the lookback period
     for file_name in os.listdir(METRICS_DIR):
-        if file_name.endswith(".info"):
+        logging.debug(f"Processing file: {file_name}")
+        if file_name.startswith("feed.metrics.") and file_name.endswith(".info"):
             file_date = datetime.strptime(file_name.split(".")[2], "%Y%m%d")
             if file_date >= cutoff_date:
-                all_metrics.extend(parse_metrics(os.path.join(METRICS_DIR, file_name)))
-
+                state = load_state()
+                all_metrics.extend(parse_metrics(os.path.join(METRICS_DIR, file_name), state))
     # Group metrics by folder and regex
     grouped_metrics = defaultdict(list)
     for metric in all_metrics:
         key = (metric["folder"], metric["regex"])
         grouped_metrics[key].append(metric)
-
     # Load the current state
     state = load_state()
-
     # Check for missing files
     missing_files_report = []
     new_state = defaultdict(set)
     for (folder, regex), records in grouped_metrics.items():
+        logging.debug(f"Checking folder: {folder} with regex: {regex}")
         valid_records = [
             record for record in records
             if record["earliest"] and record["latest"]
@@ -111,7 +173,7 @@ def check_missing_files():
             median_window = calculate_median_window(times[-5:])
             if median_window:
                 lower_bound, upper_bound = median_window
-
+                logging.debug(f"Median window for folder '{folder}' and regex '{regex}': {lower_bound} - {upper_bound}")
                 # Check if today's file is within the window
                 today_records = [
                     record for record in valid_records
@@ -124,29 +186,30 @@ def check_missing_files():
                 if within_window:
                     new_state[folder].add(regex)
                 elif regex not in state[folder]:
-                    missing_files_report.append(
-                        f"Folder: {folder}, Pattern: {regex}, Expected Window: {lower_bound}-{upper_bound}"
-                    )
-
+                    # Perform real-time folder check before finalizing missing
+                    if not real_time_folder_check(folder, regex):
+                        missing_files_report.append(
+                            f"Folder: {folder}, Pattern: {regex}, Expected Window: {lower_bound}-{upper_bound}"
+                        )
+                    else:
+                        logging.debug(f"Today's files found in {folder}.")
+            else:
+                logging.warning(f"Not enough data to calculate the expected median time of file arrival for {folder}.")
     # Save the updated state
     save_state(new_state)
-
     # Generate the report file name with a timestamp
-    report_file_name = f"feedfile_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    report_file_name = f"file_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     report_file_path = os.path.join(METRICS_DIR, report_file_name)
-
     # Write the report to a file
     with open(report_file_path, 'w') as f:
         if missing_files_report:
             f.write("\n".join(missing_files_report))
         else:
             f.write("No missing files detected.")
-
     return bool(missing_files_report)
 
 if __name__ == "__main__":
     if check_missing_files():
-        print("Alert: Missing files detected. Check the report.")
+        logging.error("Alert: Missing files detected. Check the report.")
     else:
-        print("No missing files detected.")
-
+        logging.info("No missing files detected.")
