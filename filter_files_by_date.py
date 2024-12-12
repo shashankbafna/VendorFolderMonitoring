@@ -37,8 +37,7 @@ def approx_date_by_mtime(file_path):
     mtime = os.path.getmtime(file_path)
     return datetime.fromtimestamp(mtime).date()
 
-def main(folder):
-    today = datetime.now().date()
+def main(folder, target_date):
     matching_files = []
     error_files = []
 
@@ -66,12 +65,12 @@ def main(folder):
                     # Ambiguous date, use mtime
                     date = approx_date_by_mtime(file_path)
 
-                if date == today:
+                if date == target_date:
                     matching_files.append(file_path)
             else:
                 error_files.append(file_path)
 
-    print("Matching files for today's date:")
+    print(f"Matching files for date {target_date}:")
     for match in matching_files:
         print(match)
 
@@ -83,6 +82,9 @@ def main(folder):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Filter files by date in filenames.")
     parser.add_argument("--folder", required=True, help="Folder to search files recursively.")
+    parser.add_argument("--date", help="Specific date to filter files (format: YYYYMMDD). If not provided, today's date is used.")
     args = parser.parse_args()
 
-    main(args.folder)
+    target_date = datetime.strptime(args.date, "%Y%m%d").date() if args.date else datetime.now().date()
+
+    main(args.folder, target_date)
