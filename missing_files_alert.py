@@ -100,23 +100,22 @@ def calculate_median_window(times):
 
 # Load the state of file arrivals
 def load_state():
-    state = defaultdict(set)
+    state = {}
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             reader = csv.reader(f)
             for row in reader:
-                folder, regex = row
-                state[folder].add(regex)
-    logging.debug(f"Loaded state: {dict(state)}")
+                folder, regex, last_latest = row
+                state[(folder, regex)] = datetime.fromtimestamp(float(last_latest))
+    logging.debug(f"Loaded state: {state}")
     return state
 
 # Save the state of file arrivals
 def save_state(state):
     with open(STATE_FILE, 'w') as f:
         writer = csv.writer(f)
-        for folder, regexes in state.items():
-            for regex in regexes:
-                writer.writerow([folder, regex])
+        for (folder, regex), last_latest in state.items():
+            writer.writerow([folder, regex, last_latest.timestamp()])
     logging.debug("State saved successfully.")
 
 # Real-time folder check to confirm if a file matching the regex exists
@@ -144,57 +143,55 @@ def real_time_folder_check(folder, regex):
 def check_missing_files():
     all_metrics = []
     cutoff_date = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+    state = load_state()
     # Read all metrics files within the lookback period
     for file_name in os.listdir(METRICS_DIR):
         logging.debug(f"Processing file: {file_name}")
         if file_name.startswith("feed.metrics.") and file_name.endswith(".info"):
             file_date = datetime.strptime(file_name.split(".")[2], "%Y%m%d")
             if file_date >= cutoff_date:
-                state = load_state()
                 all_metrics.extend(parse_metrics(os.path.join(METRICS_DIR, file_name), state))
     # Group metrics by folder and regex
     grouped_metrics = defaultdict(list)
     for metric in all_metrics:
         key = (metric["folder"], metric["regex"])
         grouped_metrics[key].append(metric)
-    # Load the current state
-    state = load_state()
-    # Check for missing files
+    new_state = {}
     missing_files_report = []
-    new_state = defaultdict(set)
     for (folder, regex), records in grouped_metrics.items():
         logging.debug(f"Checking folder: {folder} with regex: {regex}")
-        valid_records = [
-            record for record in records
-            if record["earliest"] and record["latest"]
+        latest_time = max(record["latest"] for record in records if record["latest"])
+        logging.debug(f"Latest historical arrival time for {folder}, {regex}: {latest_time}")
+        if (folder, regex) in state:
+            previous_latest = state[(folder, regex)]
+            if latest_time == previous_latest:
+                logging.debug(f"No change in latest arrival time for {folder}, {regex}. Skipping validation.")
+                new_state[(folder, regex)] = previous_latest
+                continue
+            else:
+                logging.debug(f"Latest arrival time changed for {folder}, {regex}. Revalidating.")
+        # Check today's file arrivals
+        today_records = [
+            record for record in records if record["capture_time"].date() == datetime.now().date()
         ]
-        times = [record["earliest"].time() for record in valid_records]
+        times = [record["earliest"].time() for record in today_records]
         if len(times) >= 5:
             median_window = calculate_median_window(times[-5:])
             if median_window:
                 lower_bound, upper_bound = median_window
-                logging.debug(f"Median window for folder '{folder}' and regex '{regex}': {lower_bound} - {upper_bound}")
-                # Check if today's file is within the window
-                today_records = [
-                    record for record in valid_records
-                    if record["capture_time"].date() == datetime.now().date()
-                ]
+                logging.debug(f"Median window for {folder}, {regex}: {lower_bound} - {upper_bound}")
                 within_window = any(
                     lower_bound <= record["earliest"].time() <= upper_bound
                     for record in today_records
                 )
                 if within_window:
-                    new_state[folder].add(regex)
-                elif regex not in state[folder]:
-                    # Perform real-time folder check before finalizing missing
-                    if not real_time_folder_check(folder, regex):
-                        missing_files_report.append(
-                            f"Folder: {folder}, Pattern: {regex}, Expected Window: {lower_bound}-{upper_bound}"
-                        )
-                    else:
-                        logging.debug(f"Today's files found in {folder}.")
+                    new_state[(folder, regex)] = latest_time
+                elif not real_time_folder_check(folder, regex):
+                    missing_files_report.append(
+                        f"Folder: {folder}, Pattern: {regex}, Expected Window: {lower_bound}-{upper_bound}"
+                    )
             else:
-                logging.warning(f"Not enough data to calculate the expected median time of file arrival for {folder}.")
+                logging.warning(f"Not enough data for median calculation: {folder}, {regex}.")
     # Save the updated state
     save_state(new_state)
     # Generate the report file name with a timestamp
